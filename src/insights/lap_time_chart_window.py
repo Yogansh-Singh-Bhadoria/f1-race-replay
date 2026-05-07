@@ -238,24 +238,11 @@ def _entry_has_gap_discontinuity(entry, pit_threshold, sc_vsc_laps):
     )
 
 
-def _legend_state_slot(entry):
-    if not entry:
-        return ""
-    if entry.get("is_terminal_lap") and entry.get("result_status"):
-        return "RET"
-    if _entry_is_pit_entry(entry):
-        return "PITS"
-    tyre = entry.get("tyre", -1)
-    tyre_name = get_tyre_compound_str(tyre)
-    if not tyre_name:
-        return ""
-    tyre_char = tyre_name[0].upper()
-    tyre_life = entry.get("tyre_life")
-    if isinstance(tyre_life, (int, float)) and tyre_life >= 0:
-        tyre_life_int = int(tyre_life)
-        if tyre_life_int > 0:
-            return f"{tyre_char}{tyre_life_int:02d}"
-    return tyre_char
+def _terminal_status_display_text(status):
+    status_text = str(status or "").strip()
+    if not status_text or status_text.lower() == "retired":
+        return "Retired due to DNF"
+    return status_text
 
 
 class LapTimeChartWindow(PitWallWindow):
@@ -270,6 +257,7 @@ class LapTimeChartWindow(PitWallWindow):
         self._known_drivers = []
         self._total_laps = 0
         self._leader_lap = 0
+        self._current_time_s = None
         self._last_drawn_lap = 0
         self._needs_full_redraw = True
         self._focused_drivers = set()   # set of codes
@@ -318,6 +306,7 @@ class LapTimeChartWindow(PitWallWindow):
         # Crosshair debounce
         self._last_crosshair_state = None
         self._hover_point_key = None
+        self._last_rendered_terminal_signature = ()
 
         super().__init__()
 
@@ -339,6 +328,51 @@ class LapTimeChartWindow(PitWallWindow):
                 border: none;
             }
         """)
+
+    def _terminal_entry_visibility_time_s(self, entry):
+        if not entry or not entry.get("is_terminal_lap"):
+            return None
+        for key in (
+            "terminal_event_time_s",
+            "replay_line_time_s",
+            "replay_end_time_s",
+            "line_time_s",
+            "end_time_s",
+        ):
+            value = entry.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return None
+
+    def _is_terminal_entry_visible(self, entry, include_final=False):
+        if not entry or not entry.get("is_terminal_lap"):
+            return False
+        if include_final:
+            return True
+        visible_at_s = self._terminal_entry_visibility_time_s(entry)
+        if visible_at_s is not None and isinstance(self._current_time_s, (int, float)):
+            return self._current_time_s >= visible_at_s
+        lap = entry.get("lap")
+        if isinstance(lap, (int, float)):
+            return self._leader_lap > int(lap)
+        return False
+
+    def _terminal_visibility_signature(self):
+        if not self._lap_times:
+            return ()
+        include_final = bool(self._total_laps and self._leader_lap >= self._total_laps)
+        visible = []
+        for code, entries in self._lap_times.items():
+            for entry in entries:
+                if self._is_terminal_entry_visible(entry, include_final=include_final):
+                    visible.append((code, int(entry.get("lap", -1))))
+        return tuple(sorted(visible))
+
+    def _completed_lap_cutoff(self):
+        include_final = bool(self._total_laps and self._leader_lap >= self._total_laps)
+        if include_final:
+            return max(0, int(self._leader_lap))
+        return max(0, int(self._leader_lap) - 1)
         
 
     def resizeEvent(self, event):
@@ -687,6 +721,9 @@ class LapTimeChartWindow(PitWallWindow):
             if tl:
                 self._total_laps = int(tl)
                 self._reserve_status_width()
+            new_time_s = sd.get("time_s", self._current_time_s)
+            if isinstance(new_time_s, (int, float)):
+                self._current_time_s = float(new_time_s)
             new_leader_lap = sd.get("lap", self._leader_lap)
             if isinstance(new_leader_lap, (int, float)):
                 self._leader_lap = int(new_leader_lap)
@@ -701,6 +738,7 @@ class LapTimeChartWindow(PitWallWindow):
             self._user_xlim = None
             self._user_ylim = None
             self._view_state_by_mode.clear()
+            self._last_rendered_terminal_signature = ()
 
         # Ingest pre-computed data from server
         if "lap_times" in data:
@@ -717,8 +755,13 @@ class LapTimeChartWindow(PitWallWindow):
         # Update driver list
         self._refresh_driver_list(drivers)
 
-        # Redraw when leader crosses a new lap or first data arrival
-        if self._leader_lap > self._last_drawn_lap or self._needs_full_redraw:
+        terminal_visibility_changed = (
+            self._terminal_visibility_signature() != self._last_rendered_terminal_signature
+        )
+
+        # Redraw when leader crosses a new lap, terminal state becomes visible,
+        # or the chart needs a full rebuild.
+        if self._leader_lap > self._last_drawn_lap or self._needs_full_redraw or terminal_visibility_changed:
             self._last_drawn_lap = self._leader_lap
             force_redraw = self._needs_full_redraw
             self._needs_full_redraw = False
@@ -894,20 +937,23 @@ class LapTimeChartWindow(PitWallWindow):
 
         focus = self._focused_drivers
 
-        # Show completed laps only during replay, but include the final lap once
-        # the race has actually finished.
+        # Show completed laps during replay. Terminal no-time laps become visible
+        # only once the replay has actually reached their event timestamp.
         visible_data = {}
         lap_cutoff = self._leader_lap
         include_final_lap = self._total_laps and self._leader_lap >= self._total_laps
+        completed_lap_cutoff = self._completed_lap_cutoff()
         for code, entries in self._lap_times.items():
-            terminal_lap = next((e["lap"] for e in entries if e.get("is_terminal_lap")), None)
-            effective_cutoff = lap_cutoff
-            if terminal_lap is not None:
-                effective_cutoff = min(effective_cutoff, terminal_lap)
             if include_final_lap:
-                visible = [e for e in entries if e["lap"] <= effective_cutoff]
+                visible = [e for e in entries if e["lap"] <= lap_cutoff or e.get("is_terminal_lap")]
             else:
-                visible = [e for e in entries if e["lap"] < effective_cutoff or (e.get("is_terminal_lap") and e["lap"] == effective_cutoff)]
+                visible = []
+                for entry in entries:
+                    if entry.get("is_terminal_lap"):
+                        if self._is_terminal_entry_visible(entry, include_final=False):
+                            visible.append(entry)
+                    elif entry["lap"] < lap_cutoff:
+                        visible.append(entry)
             if visible:
                 visible_data[code] = visible
 
@@ -923,9 +969,9 @@ class LapTimeChartWindow(PitWallWindow):
         # to prevent label overlap (e.g. VSC → SC on consecutive laps).
         merged_zones = []
         for sp in self._status_laps:
-            if sp["start_lap"] > self._leader_lap:
+            if sp["start_lap"] > completed_lap_cutoff:
                 continue
-            end_lap = min(sp["end_lap"], self._leader_lap)
+            end_lap = min(sp["end_lap"], completed_lap_cutoff)
             status = sp["status"]
             if status == "4":
                 colour, label = _SC_COLOUR, "SC"
@@ -1129,13 +1175,13 @@ class LapTimeChartWindow(PitWallWindow):
         self._cached_gap_adjustments = gap_adjustments
         self._cached_gap_overrides = gap_overrides
         self._cached_gap_suppressed_laps = gap_suppressed_laps
-        self._cached_terminal_no_time_points = []
+        self._cached_terminal_marker_points = []
         self._cached_hover_candidates = []
                         
         for sp in self._status_laps:
-            if sp["start_lap"] > self._leader_lap:
+            if sp["start_lap"] > completed_lap_cutoff:
                 continue
-            end_lap = min(sp["end_lap"], self._leader_lap)
+            end_lap = min(sp["end_lap"], completed_lap_cutoff)
             status = sp["status"]
             if status not in ("4", "5", "6", "7"):
                 continue
@@ -1181,7 +1227,6 @@ class LapTimeChartWindow(PitWallWindow):
         driver_stints_text = {}
         display_y_vals = []
         all_axis_y_vals = []
-        legend_slot_by_code = {}
 
         session_best = float("inf")
         for code_sb, entries in visible_data.items():
@@ -1194,8 +1239,6 @@ class LapTimeChartWindow(PitWallWindow):
 
         for code, entries in visible_data.items():
             colour = self._driver_colors.get(code, _DEFAULT_COLOUR)
-            if entries:
-                legend_slot_by_code[code] = _legend_state_slot(entries[-1])
 
             if focus:
                 is_focused = code in focus
@@ -1212,7 +1255,7 @@ class LapTimeChartWindow(PitWallWindow):
             clean_laps, clean_vals, clean_time_s, clean_tyres = [], [], [], []
             pit_laps = []
             all_laps, all_vals, all_markers, all_marker_colours = [], [], [], []
-            terminal_no_time_laps = []
+            terminal_marker_entries = []
             
             drv_clean_times = [
                 e["time_s"] for e in entries
@@ -1232,18 +1275,37 @@ class LapTimeChartWindow(PitWallWindow):
                 if pure_pace and (lap in sc_vsc_laps or is_pit_affected or is_out_lap or is_outlier):
                     continue
 
+                terminal_generated_entry = bool(e.get("is_terminal_lap") and raw_time < 0)
                 gap_is_approx = False
                 if self._is_gap_mode():
                     gap_val, gap_is_approx = self._display_gap_meta(e, leader_refs, code)
+                    if terminal_generated_entry:
+                        terminal_marker_entries.append({
+                            "entry": e,
+                            "prev_lap": all_laps[-1] if all_laps else None,
+                            "prev_val": all_vals[-1] if all_vals else None,
+                            "display_val": gap_val,
+                        })
+                        if is_pit_entry:
+                            pit_laps.append(lap)
+                        continue
                     val = gap_val
                     if val is None:
                         if is_pit_entry:
                             pit_laps.append(lap)
                         continue
                 else:
+                    if terminal_generated_entry:
+                        terminal_marker_entries.append({
+                            "entry": e,
+                            "prev_lap": all_laps[-1] if all_laps else None,
+                            "prev_val": all_vals[-1] if all_vals else None,
+                            "display_val": None,
+                        })
+                        if is_pit_entry:
+                            pit_laps.append(lap)
+                        continue
                     if raw_time < 0:
-                        if e.get("is_terminal_lap"):
-                            terminal_no_time_laps.append(lap)
                         if is_pit_entry:
                             pit_laps.append(lap)
                         continue
@@ -1382,23 +1444,23 @@ class LapTimeChartWindow(PitWallWindow):
                         transform=ax.get_xaxis_transform()
                     )
 
-            if terminal_no_time_laps and focus and is_focused and self._is_time_mode():
-                for pl in terminal_no_time_laps:
-                    status_text = next(
-                        (
-                            e.get("result_status", "Retired")
-                            for e in entries
-                            if e.get("lap") == pl and e.get("is_terminal_lap")
-                        ),
-                        "Retired",
-                    )
-                    self._cached_terminal_no_time_points.append({
+            if terminal_marker_entries and focus and is_focused and not pure_pace:
+                for item in terminal_marker_entries:
+                    e = item["entry"]
+                    self._cached_terminal_marker_points.append({
                         "code": code,
-                        "lap": pl,
+                        "lap": e["lap"],
                         "colour": colour,
                         "alpha": alpha,
                         "zorder": zorder + 2,
-                        "status": status_text,
+                        "line_width": lw,
+                        "prev_lap": item.get("prev_lap"),
+                        "prev_val": item.get("prev_val"),
+                        "display_val": item.get("display_val"),
+                        "tyre": e.get("tyre", -1),
+                        "tyre_life": e.get("tyre_life", 0),
+                        "status": _terminal_status_display_text(e.get("result_status")),
+                        "is_pit_entry": bool(e.get("is_pit_entry")),
                     })
 
         # ── 4b. HUD Statistics (prepared for drawing at the end) ──
@@ -1445,14 +1507,27 @@ class LapTimeChartWindow(PitWallWindow):
                 pad = max(2.0, (y_max_display - y_min_display) * 0.06)
                 ax.set_ylim(y_min_display - pad, y_max_display + pad)
 
-        if self._cached_terminal_no_time_points and self._is_time_mode():
+        if self._cached_terminal_marker_points:
             y_lo, y_hi = ax.get_ylim()
             span = max(y_hi - y_lo, 1.0)
             marker_y = y_hi - span * 0.045
-            for point in self._cached_terminal_no_time_points:
-                point["val"] = marker_y
+            for point in self._cached_terminal_marker_points:
+                draw_val = point.get("display_val")
+                if draw_val is None:
+                    draw_val = marker_y
+                point["val"] = draw_val
+                if point.get("prev_lap") is not None and point.get("prev_val") is not None:
+                    ax.plot(
+                        [point["prev_lap"], point["lap"]],
+                        [point["prev_val"], draw_val],
+                        color=point["colour"],
+                        alpha=min(1.0, point["alpha"] * 0.95),
+                        linewidth=max(1.0, point.get("line_width", 1.0)),
+                        linestyle="-",
+                        zorder=point["zorder"] - 1,
+                    )
                 ax.scatter(
-                    point["lap"], marker_y,
+                    point["lap"], draw_val,
                     marker="o", facecolors=_BG, edgecolors=point["colour"],
                     alpha=point["alpha"], s=46, linewidths=1.4,
                     zorder=point["zorder"],
@@ -1461,13 +1536,13 @@ class LapTimeChartWindow(PitWallWindow):
                     "code": point["code"],
                     "lap": point["lap"],
                     "time_s": -1.0,
-                    "val": marker_y,
-                    "tyre": -1,
-                    "tyre_life": 0,
-                    "is_pit_entry": False,
+                    "val": draw_val,
+                    "tyre": point.get("tyre", -1),
+                    "tyre_life": point.get("tyre_life", 0),
+                    "is_pit_entry": point.get("is_pit_entry", False),
                     "is_approx": False,
                     "is_terminal_no_time": True,
-                    "status": point.get("status", "Retired"),
+                    "status": point.get("status", "Retired due to DNF"),
                 })
 
         # X-axis
@@ -1480,12 +1555,8 @@ class LapTimeChartWindow(PitWallWindow):
         # ── 6. Interactive legend (click to isolate) ──
         handles, labels = ax.get_legend_handles_labels()
         if handles and self._legend_visible:
-            display_labels = []
-            for code in labels:
-                indicator = legend_slot_by_code.get(code, "")
-                display_labels.append(f"{code:<3}  {indicator:<4}")
             leg = ax.legend(
-                handles, display_labels,
+                handles, labels,
                 loc="upper right", fontsize=7, framealpha=0.6,
                 facecolor=_BG, edgecolor="#555555", labelcolor=_TEXT,
                 ncol=2 if len(handles) > 10 else 1,
@@ -1504,7 +1575,6 @@ class LapTimeChartWindow(PitWallWindow):
                 }
             for leg_text, orig_label in zip(leg.get_texts(), labels):
                 leg_text.set_picker(True)
-                leg_text.set_fontfamily("monospace")
                 self._legend_map[leg_text] = orig_label
                 self._legend_text_by_code[orig_label] = leg_text
                 self._legend_text_style_by_code[orig_label] = {
@@ -1584,6 +1654,7 @@ class LapTimeChartWindow(PitWallWindow):
         self._rebuild_hover_screen_cache()
         self._has_ever_drawn = True
         self._last_crosshair_state = None
+        self._last_rendered_terminal_signature = self._terminal_visibility_signature()
         if not self._restore_hover_point(previous_hover_point_key):
             self._refresh_hover_from_cursor()
         self._canvas.draw_idle()
@@ -1966,11 +2037,10 @@ class LapTimeChartWindow(PitWallWindow):
             extra_lines.append(info["status"])
 
         if info.get("is_terminal_no_time"):
-            text = (
-                f"{info['code']}  Lap {info['lap']}\n"
-                f"Lap time not available\n"
-                f"({info.get('status', 'Retired')})"
-            )
+            text = f"{info['code']}  Lap {info['lap']}"
+            if tyre_name:
+                text += f"\n({tyre_name}{tyre_life_str})"
+            text += f"\n{_terminal_status_display_text(info.get('status'))}"
         elif self._is_gap_mode():
             text = (
                 f"{info['code']}  Lap {info['lap']}{badge}\n"
