@@ -9,3 +9,4 @@ questionary
 rich
 uvicorn
 requests
+fastapi
