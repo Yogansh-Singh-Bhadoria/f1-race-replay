@@ -157,7 +157,7 @@ def _process_single_driver(args):
 def load_session(year, round_number, session_type="R"):
     # session_type: 'R' (Race), 'S' (Sprint) etc.
     session = fastf1.get_session(year, round_number, session_type)
-    session.load(telemetry=True, weather=True)
+    session.load(laps=True , telemetry=True, weather=True)
     return session
 
 
@@ -1515,3 +1515,73 @@ def list_sprints(year):
     else:
         for _, event in sprints.iterrows():
             print(f"{event['RoundNumber']}: {event['EventName']}")
+
+def optimize_frames_for_api(frames, driver_colors, target_fps=2, source_fps=FPS):
+    """Downsample + transpose to columnar format for a much smaller JSON payload."""
+    step = max(1, source_fps // target_fps)
+    sampled = frames[::step]
+ 
+    driver_codes = list(driver_colors.keys())
+ 
+    t = []
+    lap = []
+    weather_track_temp, weather_air_temp, weather_rain = [], [], []
+    safety_car_x, safety_car_y, safety_car_phase = [], [], []
+ 
+    drivers = {code: {
+        "x": [], "y": [], "speed": [], "gear": [], "drs": [],
+        "throttle": [], "brake": [], "position": [], "tyre": [],
+        "tyre_life": [], "in_pit": []
+    } for code in driver_codes}
+ 
+    for f in sampled:
+        t.append(f["t"])
+        lap.append(f["lap"])
+ 
+        w = f.get("weather")
+        weather_track_temp.append(round(w["track_temp"], 1) if w and w.get("track_temp") is not None else None)
+        weather_air_temp.append(round(w["air_temp"], 1) if w and w.get("air_temp") is not None else None)
+        weather_rain.append(w["rain_state"] if w else None)
+ 
+        sc = f.get("safety_car")
+        safety_car_x.append(round(sc["x"], 1) if sc else None)
+        safety_car_y.append(round(sc["y"], 1) if sc else None)
+        safety_car_phase.append(sc["phase"] if sc else None)
+ 
+        for code in driver_codes:
+            d = f["drivers"].get(code)
+            arr = drivers[code]
+            if d:
+                arr["x"].append(round(d["x"], 1))
+                arr["y"].append(round(d["y"], 1))
+                arr["speed"].append(round(d["speed"], 1))
+                arr["gear"].append(d["gear"])
+                arr["drs"].append(d["drs"])
+                arr["throttle"].append(round(d["throttle"], 1))
+                arr["brake"].append(round(d["brake"], 1))
+                arr["position"].append(d["position"])
+                arr["tyre"].append(int(d["tyre"]))
+                arr["tyre_life"].append(round(d["tyre_life"], 1))
+                arr["in_pit"].append(d["in_pit"])
+            else:
+                for k in arr:
+                    arr[k].append(None)
+ 
+    return {
+        "t": t,
+        "lap": lap,
+        "weather": {
+            "track_temp": weather_track_temp,
+            "air_temp": weather_air_temp,
+            "rain_state": weather_rain,
+        },
+        "safety_car": {
+            "x": safety_car_x,
+            "y": safety_car_y,
+            "phase": safety_car_phase,
+        },
+        "drivers": drivers,
+        "fps": target_fps,
+        "frame_count": len(sampled),
+    }
+ 
